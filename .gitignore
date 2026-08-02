@@ -5,3 +5,5 @@ app/data/app.db
 
 # Cached tiles
 app/data/tiles/*.tif
+/.aiassistant/
+/.junie/

@@ -2,20 +2,22 @@ import logging
 import math
 import os
 from collections.abc import Iterator
+from datetime import datetime, timedelta
+
 import httpx
 import numpy as np
+import pyproj
 import rasterio
 from rasterio.errors import WindowError
-from rasterio.windows import from_bounds
 from rasterio.features import geometry_mask
-from datetime import datetime, timedelta
+from rasterio.windows import from_bounds
+from shapely.geometry import GeometryCollection, Point, box, mapping, shape
+from shapely.ops import transform
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.config import settings, tile_expiry
 from app.models.models import CachedTile
-from app.config import settings
-from shapely.geometry import GeometryCollection, Point, box, mapping, shape
-import pyproj
-from shapely.ops import transform
 
 
 def get_worldcover_tile_id(lat: float, lon: float) -> str:
@@ -73,12 +75,12 @@ class WorldCoverService:
         cached_tile = result.scalar_one_or_none()
 
         now = datetime.utcnow()
-        one_week_later = now + timedelta(days=7)
+        expires_at = now + timedelta(days=tile_expiry)
 
         if cached_tile:
             # Update expiration
             cached_tile.last_used_at = now
-            cached_tile.expires_at = one_week_later
+            cached_tile.expires_at = expires_at
             await self.db.commit()
             return cached_tile.file_path
 
@@ -101,7 +103,7 @@ class WorldCoverService:
             tile_id=tile_id,
             file_path=file_path,
             last_used_at=now,
-            expires_at=one_week_later
+            expires_at=expires_at
         )
         self.db.add(new_tile)
         await self.db.commit()

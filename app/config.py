@@ -1,5 +1,7 @@
 import os
+
 from pydantic_settings import BaseSettings
+
 
 class Settings(BaseSettings):
     DATABASE_URL: str = "sqlite+aiosqlite:///app/data/app.db"
@@ -13,6 +15,7 @@ class Settings(BaseSettings):
         env_file = ".env"
 
 settings = Settings()
+tile_expiry = 365
 
 # Create cache dir if it doesn't exist locally for development
 try:

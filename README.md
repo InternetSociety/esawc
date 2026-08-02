@@ -71,7 +71,8 @@ To optimize performance and storage, the server implements an automated tile man
 - **Persistence**: Tiles are stored in `/app/data/tiles`.
 - **Expiration**: 
   - Tile records are kept in SQLite.
-  - Expiration is set to **one week** from the last use.
+  - Expiration defaults to **365 days** from the last use.
+  - Configure the number of days with `tile_expiry` in `app/config.py`.
   - Expired tiles are automatically deleted from storage and database.
 
 ## User Management
