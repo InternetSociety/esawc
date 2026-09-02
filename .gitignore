@@ -1,9 +1,16 @@
+.env
+.coverage
+.coverage.*
+.venv/
+.idea/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+**/__pycache__/
+**/*.py[cod]
+docker-compose.yml
 tunnel.env
-
-# Database
-app/data/app.db
-
-# Cached tiles
+app/data/*.db*
 app/data/tiles/*.tif
 /.aiassistant/
 /.junie/
