@@ -1,25 +1,54 @@
-from typing import Optional, Dict
-from pydantic import BaseModel, EmailStr
+from datetime import datetime
+from typing import Annotated
+
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, RootModel
+
+Password = Annotated[str, Field(min_length=8, max_length=128)]
+
 
 class UserBase(BaseModel):
     email: EmailStr
 
+
 class UserCreate(UserBase):
-    password: str
+    password: Password
     is_admin: bool = False
 
+
+class UserUpdate(BaseModel):
+    is_active: bool | None = None
+    is_admin: bool | None = None
+
+
 class UserResponse(UserBase):
+    model_config = ConfigDict(from_attributes=True)
+
     id: int
     is_active: bool
     is_admin: bool
-    password_hash: str # Specified to show hash in management
-    bearer_token: Optional[str] # Specified to show unencrypted token
+    created_at: datetime
+    last_login_at: datetime | None
 
-    class Config:
-        from_attributes = True
+
+class UserCredentialResponse(UserResponse):
+    bearer_token: str | None
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+
 
 class LandCoverResponse(BaseModel):
-    land_cover_class: int # rename to 'class' in response if needed
+    model_config = ConfigDict(populate_by_name=True)
 
-class LandCoverFractionsResponse(BaseModel):
-    fractions: Dict[str, float]
+    land_cover_class: int = Field(alias="class")
+
+
+class LandCoverFractionsResponse(RootModel[dict[str, float]]):
+    pass
+
+
+class ResetPasswordRequest(BaseModel):
+    code: str = Field(min_length=1)
+    password: Password

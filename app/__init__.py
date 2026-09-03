@@ -1,0 +1,1 @@
+"""ESA WorldCover API package."""

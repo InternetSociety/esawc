@@ -1,86 +1,113 @@
-from typing import Optional
-from fastapi import Depends, HTTPException, status, Request
-from fastapi.security import OAuth2PasswordBearer, APIKeyHeader
+from typing import Annotated
+from urllib.parse import urlparse
+
+from fastapi import Depends, HTTPException, Request, Security, status
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from jose import JWTError, jwt
-from passlib.context import CryptContext
+
+from app.config import settings
 from app.database import get_db
 from app.models.models import User
-from app.config import settings
+from app.repositories.tiles import TileRepository
+from app.repositories.users import UserRepository
+from app.services.mailer import Mailer
+from app.services.passwords import password_hasher
+from app.services.tokens import TokenService
+from app.services.users import UserService
+from app.services.worldcover import WorldCoverService
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-SESSION_COOKIE_NAME = "esawc_session"
+SESSION_COOKIE_NAME = settings.session_cookie_name
+bearer_scheme = HTTPBearer(auto_error=False, scheme_name="BearerAuth")
 
-# For Web UI Login (Cookies/Session would be better but keeping it simple with JWT if needed, 
-# or just use the database session if possible. The prompt says "Bearer token authentication").
-# API uses Bearer Token. Web UI will need some way to know who is logged in.
+DatabaseSession = Annotated[AsyncSession, Depends(get_db)]
+BearerCredentials = Annotated[
+    HTTPAuthorizationCredentials | None,
+    Security(bearer_scheme),
+]
 
-oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token", auto_error=False)
-bearer_header = APIKeyHeader(name="Authorization", auto_error=False)
+
+def get_user_repository(session: DatabaseSession) -> UserRepository:
+    return UserRepository(session)
+
+
+def get_tile_repository(session: DatabaseSession) -> TileRepository:
+    return TileRepository(session)
+
+
+def get_user_service(
+    repository: Annotated[UserRepository, Depends(get_user_repository)],
+) -> UserService:
+    return UserService(repository, password_hasher, Mailer(settings))
+
+
+def get_worldcover_service(
+    repository: Annotated[TileRepository, Depends(get_tile_repository)],
+) -> WorldCoverService:
+    return WorldCoverService(repository)
+
 
 async def get_current_user(
     request: Request,
-    db: AsyncSession = Depends(get_db)
-) -> Optional[User]:
-    # Check Authorization header first
-    auth_header = request.headers.get("Authorization")
-    token = None
-    if auth_header and auth_header.startswith("Bearer "):
-        token = auth_header[7:]
-    
-    # If no token from Authorization header, check cookie
-    if not token:
-        cookie_token = request.cookies.get(SESSION_COOKIE_NAME)
-        if cookie_token and cookie_token.startswith("Bearer "):
-            token = cookie_token[7:]
+    credentials: BearerCredentials,
+    repository: Annotated[UserRepository, Depends(get_user_repository)],
+) -> User | None:
+    token_service = TokenService(settings)
+    if credentials:
+        user = await repository.get_by_bearer_token(credentials.credentials)
+        if user:
+            return user
+        email = token_service.decode(credentials.credentials, "access")
+        return await repository.get_by_email(email) if email else None
 
-    if not token:
+    session_token = request.cookies.get(SESSION_COOKIE_NAME)
+    if not session_token:
         return None
-    
-    # Check if token is a bearer token from DB
-    # The prompt says "The user management page should also allow the admin to regenerate the bearer token for any user."
-    # and "it will use bearer token authentication."
-    
-    # First try as a direct bearer token match in DB
-    result = await db.execute(select(User).where(User.bearer_token == token))
-    user = result.scalar_one_or_none()
-    if user:
-        return user
-    
-    # If not found, it might be a JWT session token (for the Web UI)
-    try:
-        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.ALGORITHM])
-        email: str = payload.get("sub")
-        if email is None:
-            return None
-    except JWTError:
-        return None
-        
-    result = await db.execute(select(User).where(User.email == email))
-    user = result.scalar_one_or_none()
-    return user
+    email = token_service.decode(session_token, "session")
+    return await repository.get_by_email(email) if email else None
+
 
 async def get_current_active_user(
     request: Request,
-    current_user: Optional[User] = Depends(get_current_user)
+    current_user: Annotated[User | None, Depends(get_current_user)],
 ) -> User:
     if not current_user:
-        # API routes (under /api) return JSON 401; UI routes redirect to login
-        if request.url.path.startswith("/api"):
+        if request.url.path.startswith("/api") or request.url.path == "/openapi.json":
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Not authenticated",
                 headers={"WWW-Authenticate": "Bearer"},
             )
-        raise HTTPException(status_code=status.HTTP_307_TEMPORARY_REDIRECT, headers={"Location": "/"})
+        raise HTTPException(
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers={"Location": "/"},
+        )
     if not current_user.is_active:
-        raise HTTPException(status_code=400, detail="Inactive user")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is inactive")
     return current_user
 
+
 async def get_current_admin_user(
-    current_user: User = Depends(get_current_active_user)
+    current_user: Annotated[User, Depends(get_current_active_user)],
 ) -> User:
     if not current_user.is_admin:
-        raise HTTPException(status_code=403, detail="Not enough permissions")
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Not authorized")
     return current_user
+
+
+def require_same_origin(request: Request) -> None:
+    """Apply strict Origin/Referer validation to cookie-authenticated mutations."""
+    if not request.cookies.get(SESSION_COOKIE_NAME):
+        return
+    source = request.headers.get("origin") or request.headers.get("referer")
+    if not source:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
+    parsed = urlparse(source)
+    if (parsed.scheme, parsed.netloc) != (request.url.scheme, request.url.netloc):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="CSRF validation failed")
+
+
+CurrentUser = Annotated[User, Depends(get_current_active_user)]
+CurrentAdmin = Annotated[User, Depends(get_current_admin_user)]
+UserServiceDependency = Annotated[UserService, Depends(get_user_service)]
+WorldCoverServiceDependency = Annotated[WorldCoverService, Depends(get_worldcover_service)]
+SameOrigin = Annotated[None, Depends(require_same_origin)]

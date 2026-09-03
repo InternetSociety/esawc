@@ -1,203 +1,118 @@
-import secrets
-from datetime import datetime, timedelta
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, status, Form, Request
-from fastapi.responses import RedirectResponse, HTMLResponse
-import markdown
+from typing import Annotated
+
+from fastapi import APIRouter, Depends, Form, HTTPException, Request, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.security import OAuth2PasswordRequestForm
-from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
-from jose import jwt
-from app.database import get_db
-from app.models.models import User, CachedTile
-from app.dependencies import (
-    SESSION_COOKIE_NAME,
-    get_current_active_user,
-    get_current_admin_user,
-    get_current_user,
-    pwd_context,
-)
+from pydantic import EmailStr
+
 from app.config import settings
-from fastapi.templating import Jinja2Templates
+from app.dependencies import CurrentUser, SameOrigin, UserServiceDependency
+from app.exceptions import InvalidCredentialsError, InvalidResetCodeError
+from app.schemas.schemas import Password, TokenResponse
+from app.services.tokens import TokenService
+from app.templates import templates
 
-router = APIRouter(tags=["Auth & UI"])
-templates = Jinja2Templates(directory="app/templates")
+router = APIRouter(tags=["Authentication"])
 
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    if expires_delta:
-        expire = datetime.utcnow() + expires_delta
-    else:
-        expire = datetime.utcnow() + timedelta(minutes=15)
-    to_encode.update({"exp": expire})
-    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=settings.ALGORITHM)
-    return encoded_jwt
 
-@router.get("/", response_class=HTMLResponse)
-async def home(request: Request, user: Optional[User] = Depends(get_current_user)):
-    return templates.TemplateResponse(
-        request=request, name="index.html", context={"user": user}
-    )
-
-@router.post("/login")
+@router.post("/login", include_in_schema=False, response_class=RedirectResponse)
 async def login(
-    username: str = Form(...),
-    password: str = Form(...),
-    db: AsyncSession = Depends(get_db)
-):
-    result = await db.execute(select(User).where(User.email == username))
-    user = result.scalar_one_or_none()
-    
-    if not user or not pwd_context.verify(password, user.password_hash):
-        return RedirectResponse(url="/?error=invalid_credentials", status_code=status.HTTP_303_SEE_OTHER)
-    
-    if not user.is_active:
-         return RedirectResponse(url="/?error=inactive", status_code=status.HTTP_303_SEE_OTHER)
-
-    access_token = create_access_token(data={"sub": user.email})
-    
-    response = RedirectResponse(url="/", status_code=status.HTTP_303_SEE_OTHER)
+    email: Annotated[EmailStr, Form()],
+    password: Annotated[str, Form()],
+    service: UserServiceDependency,
+) -> RedirectResponse:
+    try:
+        user = await service.authenticate(str(email), password)
+    except InvalidCredentialsError:
+        return RedirectResponse(
+            "/?error=invalid_credentials", status_code=status.HTTP_303_SEE_OTHER
+        )
+    token = TokenService(settings).create(user.email, "session")
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
     response.set_cookie(
-        key=SESSION_COOKIE_NAME,
-        value=f"Bearer {access_token}",
+        key=settings.session_cookie_name,
+        value=token,
+        max_age=settings.session_max_age_seconds,
         httponly=True,
-        max_age=settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        secure=settings.cookie_secure,
         samesite="lax",
-        path="/"
+        path="/",
     )
     return response
 
-@router.post("/token") # For FastAPI /docs login
+
+@router.post("/token", response_model=TokenResponse)
 async def login_for_access_token(
-    db: AsyncSession = Depends(get_db),
-    form_data: OAuth2PasswordRequestForm = Depends()
-):
-    result = await db.execute(select(User).where(User.email == form_data.username))
-    user = result.scalar_one_or_none()
-    if not user or not pwd_context.verify(form_data.password, user.password_hash):
-        raise HTTPException(status_code=400, detail="Incorrect email or password")
-    
-    access_token = create_access_token(data={"sub": user.email})
-    return {"access_token": access_token, "token_type": "bearer"}
+    form_data: Annotated[OAuth2PasswordRequestForm, Depends()],
+    service: UserServiceDependency,
+) -> TokenResponse:
+    try:
+        user = await service.authenticate(form_data.username, form_data.password)
+    except InvalidCredentialsError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from exc
+    return TokenResponse(access_token=TokenService(settings).create(user.email, "access"))
 
-@router.post("/logout")
-async def logout():
-    response = RedirectResponse(url="/", status_code=status.HTTP_302_FOUND)
-    response.delete_cookie(SESSION_COOKIE_NAME, path="/", samesite="lax")
+
+@router.post("/logout", include_in_schema=False, response_class=RedirectResponse)
+async def logout(_user: CurrentUser, _same_origin: SameOrigin) -> RedirectResponse:
+    response = RedirectResponse("/", status_code=status.HTTP_303_SEE_OTHER)
+    response.delete_cookie(
+        settings.session_cookie_name,
+        path="/",
+        secure=settings.cookie_secure,
+        httponly=True,
+        samesite="lax",
+    )
     return response
 
-@router.get("/manage-users", response_class=HTMLResponse)
-async def manage_users_page(
+
+@router.get("/forgot-password", include_in_schema=False, response_class=HTMLResponse)
+async def forgot_password_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(request, "forgot_password.html", {})
+
+
+@router.post("/forgot-password", include_in_schema=False, response_class=HTMLResponse)
+async def forgot_password(
     request: Request,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_active_user)
-):
-    if current_user.is_admin:
-        result = await db.execute(select(User))
-        users = result.scalars().all()
-    else:
-        users = [current_user]
-    
+    email: Annotated[EmailStr, Form()],
+    service: UserServiceDependency,
+) -> HTMLResponse:
+    await service.request_password_reset(str(email))
     return templates.TemplateResponse(
-        request=request, name="users.html", context={
-            "current_user": current_user,
-            "users": users
-        }
+        request,
+        "forgot_password.html",
+        {"acknowledgement": True},
     )
 
-@router.post("/users/create")
-async def create_user_route(
-    email: str = Form(...),
-    password: str = Form(...),
-    is_admin: bool = Form(False),
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
-):
-    result = await db.execute(select(User).where(User.email == email))
-    if result.scalar_one_or_none():
-        raise HTTPException(status_code=400, detail="User already exists")
-    
-    bearer_token = secrets.token_urlsafe(32) if not is_admin else None
-    new_user = User(
-        email=email,
-        password_hash=pwd_context.hash(password),
-        is_admin=is_admin,
-        is_active=True,
-        bearer_token=bearer_token
-    )
-    db.add(new_user)
-    await db.commit()
-    return RedirectResponse(url="/manage-users", status_code=status.HTTP_303_SEE_OTHER)
 
-@router.post("/users/{user_id}/regen-token")
-async def regen_token(
-    user_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
-):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user and not user.is_admin:
-        user.bearer_token = secrets.token_urlsafe(32)
-        await db.commit()
-    return RedirectResponse(url="/manage-users", status_code=status.HTTP_303_SEE_OTHER)
+@router.get("/reset-password", include_in_schema=False, response_class=HTMLResponse)
+async def reset_password_page(request: Request) -> HTMLResponse:
+    return templates.TemplateResponse(request, "reset_password.html", {})
 
-@router.post("/users/{user_id}/toggle-active")
-async def toggle_active(
-    user_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
-):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user:
-        user.is_active = not user.is_active
-        await db.commit()
-    return RedirectResponse(url="/manage-users", status_code=status.HTTP_303_SEE_OTHER)
 
-@router.post("/users/{user_id}/toggle-admin")
-async def toggle_admin(
-    user_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
-):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user:
-        user.is_admin = not user.is_admin
-        # If becoming admin, remove bearer token? The prompt implies only non-admins have tokens
-        if user.is_admin:
-            user.bearer_token = None
-        else:
-            user.bearer_token = secrets.token_urlsafe(32)
-        await db.commit()
-    return RedirectResponse(url="/manage-users", status_code=status.HTTP_303_SEE_OTHER)
-
-@router.post("/users/{user_id}/delete")
-async def delete_user(
-    user_id: int,
-    db: AsyncSession = Depends(get_db),
-    current_user: User = Depends(get_current_admin_user)
-):
-    result = await db.execute(select(User).where(User.id == user_id))
-    user = result.scalar_one_or_none()
-    if user:
-        await db.delete(user)
-        await db.commit()
-    return RedirectResponse(url="/manage-users", status_code=status.HTTP_303_SEE_OTHER)
-
-@router.get("/tile-cache", response_class=HTMLResponse)
-async def tile_cache_page(request: Request, db: AsyncSession = Depends(get_db), current_user: User = Depends(get_current_active_user)):
-    result = await db.execute(select(CachedTile))
-    tiles = result.scalars().all()
-    return templates.TemplateResponse(
-        request=request, name="tile_cache.html", context={"tiles": tiles}
-    )
-
-@router.get("/app-docs", response_class=HTMLResponse)
-async def app_docs(request: Request, current_user: User = Depends(get_current_active_user)):
-    with open("README.md", "r") as f:
-        content = markdown.markdown(f.read(), extensions=["fenced_code", "tables"])
-    return templates.TemplateResponse(
-        request=request, name="app_docs.html", context={"content": content}
-    )
+@router.post(
+    "/reset-password",
+    include_in_schema=False,
+    response_class=HTMLResponse,
+    response_model=None,
+)
+async def reset_password(
+    request: Request,
+    code: Annotated[str, Form(min_length=1)],
+    password: Annotated[Password, Form()],
+    service: UserServiceDependency,
+) -> HTMLResponse | RedirectResponse:
+    try:
+        await service.reset_password(code, password)
+    except InvalidResetCodeError:
+        return templates.TemplateResponse(
+            request,
+            "reset_password.html",
+            {"error": "The reset code is invalid or expired."},
+            status_code=status.HTTP_400_BAD_REQUEST,
+        )
+    return RedirectResponse("/?reset=success", status_code=status.HTTP_303_SEE_OTHER)
