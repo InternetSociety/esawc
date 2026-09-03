@@ -13,11 +13,10 @@ Use Docker Engine and Docker Compose. Do not install or run the Python toolchain
 1. Copy `docker-compose.yml.example` to the untracked file `docker-compose.yml`.
 2. Copy `.env.example` to the untracked file `.env`.
 3. Replace `JWT_SECRET` with a long random value. Set `COOKIE_SECURE=true` for production HTTPS.
-4. Start the service and apply migrations:
+4. Start the service. The container applies pending database migrations before it starts:
 
 ```console
 docker compose up --build -d
-docker compose run --rm app alembic upgrade head
 ```
 
 5. Create the first administrator. The command prompts for the password without displaying it:
@@ -54,7 +53,7 @@ Configure `SMTP_ENABLED`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_SENDER`, and `SMTP_STA
 ```console
 docker compose up --build
 docker compose down
-docker compose run --rm app alembic upgrade head
+docker compose run --rm app alembic upgrade head # apply migrations manually, if required
 docker compose run --rm app pytest
 docker compose run --rm app pytest --cov=app
 docker compose run --rm app ruff check .
