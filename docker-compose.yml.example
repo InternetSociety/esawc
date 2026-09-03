@@ -4,7 +4,6 @@ services:
     env_file:
       - .env
     volumes:
-      - .:/app
       - ./app/data:/app/data
     ports:
       - "8001:8001"

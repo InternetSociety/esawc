@@ -12,7 +12,10 @@ depends_on: str | Sequence[str] | None = None
 
 
 def upgrade() -> None:
-    op.drop_index("idx_users_email", table_name="users")
+    bind = op.get_bind()
+    user_indexes = {index["name"] for index in sa.inspect(bind).get_indexes("users")}
+    if "idx_users_email" in user_indexes:
+        op.drop_index("idx_users_email", table_name="users")
     with op.batch_alter_table("users") as batch_op:
         batch_op.alter_column("id", existing_type=sa.Integer(), nullable=False)
         batch_op.alter_column(
